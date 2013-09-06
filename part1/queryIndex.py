@@ -1,0 +1,240 @@
+import sys
+from porter_stemming import PorterStemmer
+from bool_parser import bool_expr_ast
+from skip_list import *
+
+class docID_pos:
+    def __init__(self, docID):
+        self.docID = docID
+        self.pos = []
+        self.freq = 0
+    def add_freq(self, length):
+        self.freq += length
+    def add_pos(self, pos):
+        self.pos = self.pos + pos
+        self.add_freq(len(pos))
+    def is_doc_equal(self, docID):
+        return docID == self.docID
+    
+class queryIndex:
+    def __init__(self, arg_stop_words, inverted_index, postingIndexFile):
+        self.stop_words = self.stop_words_set(arg_stop_words)
+        self.inverted_index = inverted_index
+        self.p = PorterStemmer()
+        self.postingIndexFile = postingIndexFile
+        
+    #build stop_words_set
+    def stop_words_set(self, arg_stop_words):
+        stop_words_set = set()
+        for line in arg_stop_words:
+            line = line.rstrip('\n')
+            stop_words_set.add(line)
+        return stop_words_set
+    
+    def determine_query(self, query):    
+        if query[0] == '"' and query[-1] == '"':
+            return 'PQ'
+        word_list = query.split()
+        if len(word_list) == 1:
+            return 'OWQ'
+        elif 'OR' in word_list or 'AND' in word_list:
+            return 'BQ'
+        else:
+            return 'FTQ'
+
+    def owq(self, query):
+        query = query.lower()
+        tokened_query = ''
+        i = 0
+        for i in range(len(query)):
+            if query[i] >= 'a' and query[i] <= 'z' or query[i] >='0' and query[i] <= '9':
+                tokened_query += query[i]
+        stemed_query = self.p.stem(tokened_query, 0, len(tokened_query) - 1)
+        if stemed_query in self.stop_words:
+            return []
+        return [stemed_query]
+    
+    def ftq(self, query):
+        query = query.lower()
+        tokened_query = ''
+        flag = False
+        i = 0
+        for i in range(len(query)):
+            if query[i] >= 'a' and query[i] <= 'z' or query[i] >='0' and query[i] <= '9':
+                tokened_query += query[i]
+                flag = False
+            else:
+                if not flag:
+                    tokened_query += ' '
+                    flag = True
+        tokened_query = tokened_query.rstrip()
+        query_list = tokened_query.split(' ')
+        query_list = filter(lambda token: token not in self.stop_words, query_list)
+        if not query_list:
+            return []
+        stemmed_list = []
+        for word in query_list:
+            stemmed_list.append(self.p.stem(word, 0, len(word) - 1))
+        return stemmed_list
+
+    def bq(self, bool_tuples):
+        parsed_list = []
+        for word in bool_tuples[1]:
+            if isinstance(word, tuple):
+                parsed_list.append(self.bq(word))
+            else:
+                query_list = self.ftq(word)
+                if query_list:
+                    token = ' '.join(query_list)
+                    parsed_list.append(token)
+        parsed_tuple = (bool_tuples[0].split(), parsed_list)
+        return parsed_tuple
+        
+    def parse_query(self, query):
+        query_type = self.determine_query(query)
+        if query_type == 'BQ':
+            res = bool_expr_ast(query)
+            return query_type, self.bq(res)
+        elif query_type == 'OWQ': 
+            return query_type, self.owq(query)
+        elif query_type == 'FTQ':
+            return query_type, self.ftq(query)         
+        else:
+            query = query[1:-1]
+            return query_type, self.ftq(query)
+
+    
+    def merge_result_and(self, result1, result2):
+        result = set(result1).intersection(set(result2))
+        return list(result)
+
+    def merge_result_or(self, result1, result2):
+        result = set(result1).union(set(result2))
+        return list(result)
+    
+    def match_bq_query(self, query_content):
+        doc_list = []
+        for item in query_content[1]:
+            if isinstance(item, tuple):
+                doc_list = doc_list + [self.match_bq_query(item)]
+            else:
+                if item not in self.inverted_index:
+                    value_list = []
+                else:
+                    value_list = self.getPostingList(item)
+                doc_list = doc_list + [value_list]
+        index = 1
+        result_list = doc_list[0]
+        while index < len(doc_list):
+            if query_content[0] == ['AND']:
+                result_list = self.merge_result_and(result_list, doc_list[index])
+            else:
+                result_list = self.merge_result_or(result_list, doc_list[index])
+            index += 1
+        return result_list
+        
+    def getPostingList(self, term, query_type = None):
+        offset_len = self.inverted_index[term]
+        offset_len_list = offset_len.split(' ')
+        self.postingIndexFile.seek(int(offset_len_list[0]))
+        postingIndex = self.postingIndexFile.read(int(offset_len_list[1]))
+        postingIndex = postingIndex.rstrip('\n')
+        posting_pos = postingIndex.split('|')
+        posting = posting_pos[0].rstrip(' ')
+        posting = posting.split(' ')
+        if query_type == None:
+            return posting
+        else:
+            pos = posting_pos[1].split(';')
+            pos_list = []
+            for item in pos:
+                if item:
+                    pos_list += [item.split(' ')]
+            return [posting] + [pos_list]
+        
+    def matching_documents(self, query):
+        parsed_query = self.parse_query(query)
+        query_type = parsed_query[0]
+        query_content = parsed_query[1]
+        if query_type == 'BQ':
+            return self.match_bq_query(query_content)
+        elif query_type == 'OWQ':
+            if query_content[0] not in self.inverted_index:
+                return []
+            res_list = self.getPostingList(query_content[0])
+            return res_list
+        elif query_type == 'FTQ':
+            result_list = []
+            for word in query_content:
+                if word not in self.inverted_index:
+                    temp_list = []
+                else:
+                    temp_list = self.getPostingList(word)
+                result_list = self.merge_result_or(result_list, temp_list)
+            return result_list
+        else:
+            if query_content[0] not in self.inverted_index:
+                page_list_1 = []
+                pos_list_1 = []
+            else:
+                first_word_list = self.getPostingList(query_content[0], 'PQ')
+                page_list_1 = first_word_list[0]
+                pos_list_1 = first_word_list[1]
+            index = 1
+            while index in range(len(query_content)):
+                page_list = []
+                pos_list = []
+                if query_content[index] in self.inverted_index:
+                    item_list = self.getPostingList(query_content[index], 'PQ')
+                    page_list_2 = item_list[0]
+                    pos_list_2 = item_list[1]
+                    i = 0
+                    j = 0
+                    while i < len(page_list_1) and j < len(page_list_2):
+                        if int(page_list_1[i]) == int(page_list_2[j]):
+                            ii = 0
+                            jj = 0
+                            temp_list = []
+                            while ii < len(pos_list_1[i]) and jj < len(pos_list_2[j]):
+                                if int(pos_list_1[i][ii]) + 1 == int(pos_list_2[j][jj]):
+                                    temp_list.append(int(pos_list_2[j][jj]))
+                                    ii += 1
+                                    jj += 1
+                                elif int(pos_list_1[i][ii]) + 1 < int(pos_list_2[j][jj]):
+                                    ii += 1
+                                else:
+                                    jj += 1
+                            if temp_list:
+                                pos_list += [temp_list]
+                                page_list.append(page_list_2[j])
+                            i += 1
+                            j += 1
+                        elif int(page_list_1[i]) < int(page_list_2[j]):
+                            i += 1
+                        else:
+                            j += 1
+                index += 1
+                page_list_1 = page_list
+                pos_list_1 = pos_list
+            return page_list_1
+                
+if __name__ == '__main__':
+    
+    arg_stop_words = open(sys.argv[1])
+    arg_myIndex = open(sys.argv[2])
+    arg_posIndex = open('postingIndex.dat')
+    inverted_index = dict()
+
+    for line in arg_myIndex:
+        line = line.rstrip('\n')
+        line_list = line.split(' ')
+        inverted_index[line_list[0]] = line_list[1] + ' ' + line_list[2]
+        
+    q = queryIndex(arg_stop_words, inverted_index, arg_posIndex)
+    for line in sys.stdin:
+        line = line.rstrip('\n')
+        res = q.matching_documents(line)
+        res = sorted(res, key = int)
+        res = ' '.join(str(x) for x in res)
+        sys.stdout.write(res + '\n')
+
